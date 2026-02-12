@@ -12,6 +12,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+
 /// Configuration for schedule algorithm.
 pub struct SchedConfig {
     /// The maximum number of running threads at the same time.
@@ -98,6 +99,7 @@ where
         F: RunnerBuilder,
         F::Runner: Runner<TaskCell = T> + Send + 'static,
     {
+        log::info!("Spawning {} threads for thread pool: {}", self.builder.sched_config.max_thread_count, self.builder.name_prefix);
         let mut threads = Vec::with_capacity(self.builder.sched_config.max_thread_count);
         for (i, local_queue) in self.local_queues.into_iter().enumerate() {
             let runner = factory.build();
@@ -116,6 +118,7 @@ where
                     .unwrap(),
             );
         }
+        log::info!("Finished spawning threads for thread pool: {}", self.builder.name_prefix);
         ThreadPool {
             remote: Remote::new(self.core),
             threads: Mutex::new(threads),
@@ -252,8 +255,7 @@ impl Builder {
                 .store(self.sched_config.min_thread_count, Ordering::SeqCst);
         }
         let (injector, local_queues) = queue::build(queue_type, self.sched_config.max_thread_count);
-        let core = Arc::new(QueueCore::new(injector, self.sched_config.clone()));
-
+        let core = QueueCore::new(injector, self.sched_config.clone());
         (
             Remote::new(core.clone()),
             LazyBuilder {

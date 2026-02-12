@@ -8,10 +8,15 @@ use crate::pool::SchedConfig;
 use crate::queue::{Extras, LocalQueue, Pop, TaskCell, TaskInjector, WithExtras};
 use fail::fail_point;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, UnparkToken};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Weak,
 };
+use std::time::{Instant, SystemTime};
+
+use std::thread;
 
 /// An usize is used to trace the threads that are working actively.
 /// To save additional memory and atomic operation, the number and
@@ -39,15 +44,37 @@ pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
     active_workers: AtomicUsize,
     config: SchedConfig,
+    queue_push_latency: AtomicU64,
+    ensure_worker_latency: AtomicU64,
+    push_count: AtomicU64,
+    last_log_time_seconds: AtomicU64,
+    log_guard: AtomicBool,
+    ensure_worker_return_early_count: AtomicU64,
+    ensure_worker_wake_up_count: AtomicU64,
 }
 
-impl<T> QueueCore<T> {
-    pub fn new(global_queue: TaskInjector<T>, config: SchedConfig) -> QueueCore<T> {
-        QueueCore {
+impl<T> QueueCore<T>
+where
+    T: TaskCell + Send,
+{
+    pub fn new(global_queue: TaskInjector<T>, config: SchedConfig) -> Arc<QueueCore<T>> {
+        let core = Arc::new(QueueCore {
             global_queue,
             active_workers: AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT),
             config,
-        }
+            queue_push_latency: AtomicU64::new(0),
+            ensure_worker_latency: AtomicU64::new(0),
+            last_log_time_seconds: AtomicU64::new(0),
+            push_count: AtomicU64::new(0),
+            log_guard: AtomicBool::new(false),
+            ensure_worker_return_early_count: AtomicU64::new(0),
+            ensure_worker_wake_up_count: AtomicU64::new(0),
+        });
+
+        // Call starting monitoring here
+        start_monitoring_thread(core.clone());
+
+        core
     }
 
     /// Ensures there are enough workers to handle pending tasks.
@@ -56,15 +83,23 @@ impl<T> QueueCore<T> {
     /// the action.
     pub fn ensure_workers(&self, source: usize) {
         let cnt = self.active_workers.load(Ordering::SeqCst);
+        // log::info!("Ensuring there are enough workers to handle pending tasks, current active workers: {}", cnt >> WORKER_COUNT_SHIFT);
+        // if is_shutdown(cnt) {
+        //     log::info!("Thread pool is shutting down, not ensuring workers");
+        // }
         if (cnt >> WORKER_COUNT_SHIFT) >= self.config.core_thread_count.load(Ordering::SeqCst)
             || is_shutdown(cnt)
         {
+            self.ensure_worker_return_early_count
+                .fetch_add(1, Ordering::SeqCst);
             return;
         }
 
+        self.ensure_worker_wake_up_count
+            .fetch_add(1, Ordering::SeqCst);
         let addr = self as *const QueueCore<T> as usize;
         let mut unparked_once = false;
-
+        // log::info!("Start ensuring workers for the thread pool");
         unsafe {
             parking_lot_core::unpark_filter(
                 addr,
@@ -73,6 +108,8 @@ impl<T> QueueCore<T> {
                     {
                         unparked_once = true;
                         FilterOp::Unpark
+                    } else if unparked_once {
+                        FilterOp::Stop
                     } else {
                         FilterOp::Skip
                     }
@@ -88,6 +125,7 @@ impl<T> QueueCore<T> {
     pub fn mark_shutdown(&self, source: usize) {
         self.active_workers.fetch_or(SHUTDOWN_BIT, Ordering::SeqCst);
         let addr = self as *const QueueCore<T> as usize;
+        // log::info!("Marking shutdown for the thread pool");
         unsafe {
             parking_lot_core::unpark_all(addr, UnparkToken(source));
         }
@@ -159,8 +197,45 @@ impl<T: TaskCell + Send> QueueCore<T> {
     ///
     /// `source` is used to trace who triggers the action.
     fn push(&self, source: usize, task: T) {
+        self.push_count.fetch_add(1, Ordering::SeqCst);
+        let mut begin_instant = Instant::now();
+        // log::info!("Pushing a new task in global queue");
         self.global_queue.push(task);
-        self.ensure_workers(source);
+        let elapsed = begin_instant.elapsed().as_micros() as u64;
+        self.queue_push_latency.fetch_add(elapsed, Ordering::SeqCst);
+        begin_instant = Instant::now();
+        //self.ensure_workers(source);
+        let elapsed = begin_instant.elapsed().as_micros() as u64;
+        self.ensure_worker_latency
+            .fetch_add(elapsed, Ordering::SeqCst);
+        // Dump the stats every 10 seconds
+        let now = SystemTime::now();
+        let elaspsed_seconds = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if elaspsed_seconds - self.last_log_time_seconds.load(Ordering::SeqCst) >= 10 {
+            if self
+                .log_guard
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let push_count = self.push_count.swap(0, Ordering::SeqCst);
+                let push_latency = self.queue_push_latency.swap(0, Ordering::SeqCst);
+                let ensure_worker_latency = self.ensure_worker_latency.swap(0, Ordering::SeqCst);
+                let ensure_worker_return_early_count = self
+                    .ensure_worker_return_early_count
+                    .swap(0, Ordering::SeqCst);
+                let ensure_worker_wake_up_count =
+                    self.ensure_worker_wake_up_count.swap(0, Ordering::SeqCst);
+                log::info!("Stats for the last 10 seconds: push_count={}, average_push_latency={}us, average_ensure_worker_latency={}us, ensure_worker_return_early_count={}, ensure_worker_wake_up_count={}", 
+                push_count, if push_count > 0 { push_latency / push_count } else { 0 }, if push_count > 0 { ensure_worker_latency / push_count } else { 0 }, ensure_worker_return_early_count, ensure_worker_wake_up_count);
+                self.last_log_time_seconds
+                    .store(elaspsed_seconds, Ordering::SeqCst);
+                self.log_guard.store(false, Ordering::SeqCst);
+            }
+        }
+        // log::info!("Called ensure_workers after pushing a new task in global queue");
     }
 
     fn default_extras(&self) -> Extras {
@@ -335,6 +410,28 @@ impl<T: TaskCell + Send> Local<T> {
     }
 }
 
+pub fn start_monitoring_thread<T>(core: Arc<QueueCore<T>>) 
+where
+    T: TaskCell + Send,
+{
+    thread::spawn(move || {
+        log::info!("Worker monitor thread for thread pool started");
+        loop {
+            let cnt = core.active_workers.load(Ordering::SeqCst);
+            if is_shutdown(cnt) {
+                break;
+            }
+            let pending_task_num = core.global_queue.len();
+            if pending_task_num > 0 {
+                core.ensure_workers(0);
+            }
+            // Sleep for a while before checking again to avoid busy loop.
+            // The latency of ensuring workers is already included in the stats, so it won't cause significant delay in scaling up when there are pending tasks.
+            thread::sleep(std::time::Duration::from_micros(100));
+        }
+        log::info!("Worker monitor thread for thread pool exited");
+    });
+}
 /// Building remotes and locals from the given queue and configuration.
 ///
 /// This is only for tests purpose so that a thread pool doesn't have to be
@@ -348,7 +445,9 @@ where
 {
     let queue_type = queue_type.into();
     let (global, locals) = crate::queue::build(queue_type, config.max_thread_count);
-    let core = Arc::new(QueueCore::new(global, config));
+    //let core = Arc::new(QueueCore::new(global, config));
+    let core = QueueCore::new(global, config);
+    //start_monitoring_thread(core.clone());
     let l = locals
         .into_iter()
         .enumerate()

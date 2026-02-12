@@ -66,6 +66,16 @@ impl<T: TaskCell + Send> TaskInjector<T> {
     }
 }
 
+impl<T> TaskInjector<T> {
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            InjectorInner::SingleLevel(q) => q.len(),
+            InjectorInner::Multilevel(q) => q.len(),
+            InjectorInner::Priority(q) => q.len(),
+        }
+    }
+}
+
 /// Popped task cell from a task queue.
 pub struct Pop<T> {
     /// The task cell

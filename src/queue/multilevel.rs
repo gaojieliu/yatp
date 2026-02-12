@@ -90,6 +90,12 @@ where
     }
 }
 
+impl<T> TaskInjector<T> {
+    pub fn len(&self) -> usize {
+        self.level_injectors.iter().map(|injector| injector.len()).sum()
+    }
+}
+
 /// The local queue of a multilevel task queue.
 pub(crate) struct LocalQueue<T> {
     local_queue: Worker<T>,

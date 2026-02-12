@@ -4,14 +4,18 @@ use crate::pool::{Local, Runner};
 use crate::queue::{Pop, TaskCell};
 use parking_lot_core::SpinWait;
 
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 pub(crate) struct WorkerThread<T, R> {
     local: Local<T>,
     runner: R,
+    pop_count: AtomicU64,
 }
 
 impl<T, R> WorkerThread<T, R> {
     pub fn new(local: Local<T>, runner: R) -> WorkerThread<T, R> {
-        WorkerThread { local, runner }
+        WorkerThread { local, runner, pop_count: AtomicU64::new(0) }
     }
 }
 
@@ -22,6 +26,12 @@ where
 {
     #[inline]
     fn pop(&mut self) -> Option<Pop<T>> {
+        let core = self.local.core();
+        let addr = core as *const _;
+        // if self.pop_count.fetch_add(1, Ordering::Relaxed) < 10 {
+        //     log::info!("Worker thread {} is trying to pop a task from queue at address {:p}", std::thread::current().name().unwrap_or("unknown"), addr);
+        // }
+        
         // Wait some time before going to sleep, which is more expensive.
         let mut spin = SpinWait::new();
         loop {
@@ -39,6 +49,7 @@ where
     }
 
     pub fn run(mut self) {
+        // log::info!("Starting worker thread: {}", std::thread::current().name().unwrap_or("unknown"));
         self.runner.start(&mut self.local);
         while !self.local.core().is_shutdown() {
             let task = match self.pop() {

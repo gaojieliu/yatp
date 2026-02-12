@@ -83,6 +83,7 @@ impl<T: TaskCell + Send> ThreadPool<T> {
 impl<T: TaskCell + Send> Drop for ThreadPool<T> {
     /// Will shutdown the thread pool if it has not.
     fn drop(&mut self) {
+        //log::info!("Dropping thread pool, shutting down");
         self.shutdown();
     }
 }
