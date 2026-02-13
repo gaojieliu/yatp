@@ -422,8 +422,14 @@ where
                 break;
             }
             let pending_task_num = core.global_queue.len();
-            if pending_task_num > 0 {
-                core.ensure_workers(0);
+            // Get the sleeping worker count
+            let sleeping_worker_cnt = core.config.core_thread_count.load(Ordering::SeqCst) - (cnt >> WORKER_COUNT_SHIFT);
+            let thread_num_to_wake = std::cmp::min(pending_task_num, sleeping_worker_cnt);
+            if thread_num_to_wake > 0 {
+                for _ in 0..thread_num_to_wake {
+                    core.ensure_workers(usize::MAX);
+                }
+                //core.ensure_workers(0);
             }
             // Sleep for a while before checking again to avoid busy loop.
             // The latency of ensuring workers is already included in the stats, so it won't cause significant delay in scaling up when there are pending tasks.
