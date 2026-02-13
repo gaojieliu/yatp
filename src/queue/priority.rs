@@ -32,10 +32,19 @@ use crate::queue::{
 struct MapKey(u64, u64);
 
 /// The injector of a single level work stealing task queue.
-#[derive(Clone)]
 pub struct TaskInjector<T> {
     queue: Arc<QueueCore<T>>,
     task_manager: PriorityTaskManager,
+}
+
+
+impl<T> Clone for TaskInjector<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            task_manager: self.task_manager.clone(),
+        }
+    }
 }
 
 impl<T> TaskInjector<T>
@@ -47,6 +56,13 @@ where
     pub fn push(&self, mut task_cell: T) {
         let priority = self.task_manager.prepare_before_push(&mut task_cell);
         self.queue.push(task_cell, priority);
+    }
+
+}
+
+impl<T> TaskInjector<T> {
+    pub fn len(&self) -> usize {
+        self.queue.pq.len()
     }
 }
 
@@ -96,6 +112,7 @@ struct QueueCore<T> {
     pq: SkipMap<MapKey, Slot<T>>,
     /// a global sequence generator to ensure all task keys are unique.
     sequence: AtomicU64,
+    pop_count: Arc<AtomicU64>,
 }
 
 impl<T> QueueCore<T> {
@@ -103,6 +120,7 @@ impl<T> QueueCore<T> {
         Self {
             pq: SkipMap::new(),
             sequence: AtomicU64::new(0),
+            pop_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -113,10 +131,17 @@ impl<T> QueueCore<T> {
 
 impl<T: TaskCell + Send + 'static> QueueCore<T> {
     fn push(&self, msg: T, priority: u64) {
+        let addr = self as *const Self;
+        // log::info!("Pushing task with priority {} into the priority queue at address {:p} with queue len: {}", priority, addr, self.pq.len());
         self.pq.insert(self.gen_key(priority), Slot::new(msg));
     }
 
     pub fn pop(&self) -> Option<Pop<T>> {
+        let addr = self as *const Self;
+        
+        // if self.pop_count.fetch_add(1, Ordering::Relaxed) < 1000000 {
+        //     // log::info!("Priority queue at address {:p} is trying to pop a task, thread name: {} with queue len: {}", addr, std::thread::current().name().unwrap_or("unknown"), self.pq.len());
+        // }
         fn into_pop<T>(mut t: T) -> Pop<T>
         where
             T: TaskCell,
@@ -129,9 +154,13 @@ impl<T: TaskCell + Send + 'static> QueueCore<T> {
             }
         }
 
-        self.pq
+        let item = self.pq
             .pop_front()
-            .map(|e| into_pop(e.value().take().unwrap()))
+            .map(|e| into_pop(e.value().take().unwrap()));
+        // if item.is_some() {
+        //     log::info!("Popping task from the priority queue at address {:p}, thread name: {} with queue len: {}", addr, std::thread::current().name().unwrap_or("unknown"), self.pq.len());
+        // }
+        item
     }
 
     #[inline]

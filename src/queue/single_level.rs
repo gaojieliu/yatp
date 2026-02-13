@@ -41,6 +41,12 @@ where
     }
 }
 
+impl<T> TaskInjector<T> {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// The local queue of a single level work stealing task queue.
 pub struct LocalQueue<T> {
     local_queue: Worker<T>,
